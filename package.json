@@ -1,5 +1,5 @@
 {
-  "name": "bun-csv-copy",
+  "name": "postgres-csv-importer",
   "private": true,
   "type": "module",
   "scripts": {
