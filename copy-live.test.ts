@@ -136,7 +136,7 @@ integration('PostgreSQL COPY integration', () => {
     test('rolls back duplicate IDs in the CSV', async () => {
         await expect(run(HEADER + 'same,a,KLAR_FAMILY\nsame,b,UBER_FAMILY\n')).rejects.toMatchObject({ code: '23505' });
         expect(await count()).toBe(0);
-        expect(messages).toContain('Import rolled back.');
+        expect(messages).toContain('Rolled back.');
     });
 
     test('package command uses DSN_LIVE and hides database error details', async () => {
@@ -191,7 +191,7 @@ integration('PostgreSQL COPY integration', () => {
         await client.query(change);
         await expect(run(VALID)).rejects.toThrow();
         expect(await count()).toBe(0);
-        expect(messages).toContain('Import rolled back.');
+        expect(messages).toContain('Rolled back.');
     });
 
     test('refuses the wrong database', async () => {
@@ -286,7 +286,7 @@ integration('PostgreSQL COPY integration', () => {
             },
         })).rejects.toThrow();
         expect(await count()).toBe(0);
-        expect(messages).toContain('Import rolled back.');
+        expect(messages).toContain('Rolled back.');
     });
 
     test('rolls back an interrupted COPY stream', async () => {
@@ -305,6 +305,6 @@ integration('PostgreSQL COPY integration', () => {
             clearTimeout(timer);
         }
         expect(await count()).toBe(0);
-        expect(messages).toContain('Import rolled back.');
+        expect(messages).toContain('Rolled back.');
     });
 });

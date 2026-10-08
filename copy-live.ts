@@ -39,14 +39,13 @@ export async function validateCsv(csvPath: string, { signal, log = () => {}, col
     profile?: ImportConfig['profile']; delimiter?: string;
 } = {}) {
     let rows = 0;
-    let headerSeen = false;
+    let lastProgress = Date.now();
     const digest = new FileDigest();
     const parser = parse({
         headers: (headers) => {
             if (headers.length !== columns.length || headers.some((header, i) => header !== columns[i])) {
-                throw new ImportError(`CSV header must be exactly ${columns.join(delimiter)}.`);
+                throw new ImportError(`CSV header must be exactly: ${columns.join(delimiter)}`);
             }
-            headerSeen = true;
             return headers;
         },
         strictColumnHandling: true,
@@ -65,7 +64,11 @@ export async function validateCsv(csvPath: string, { signal, log = () => {}, col
                 callback(new ImportError(`CSV data row ${rows + 1} has an unsupported credit_line_family.`));
             } else {
                 rows++;
-                if (rows % 1_000_000 === 0) log(`Validated ${rows.toLocaleString('en-US')} rows.`);
+                const now = Date.now();
+                if (now - lastProgress >= 5_000) {
+                    log(`Validated ${rows.toLocaleString('en-US')} rows...`);
+                    lastProgress = now;
+                }
                 callback();
             }
         },
@@ -77,7 +80,7 @@ export async function validateCsv(csvPath: string, { signal, log = () => {}, col
         if (signal?.aborted) throw new ImportError('CSV validation was interrupted.');
         throw new ImportError(`CSV validation failed near data row ${rows + 1}. Check file access and CSV syntax.`);
     }
-    if (!headerSeen || rows === 0) throw new ImportError('CSV must contain the expected header and at least one data row.');
+    if (rows === 0) throw new ImportError('CSV must contain the expected header and at least one data row.');
     return { rows, bytes: digest.bytes, sha256: digest.digest() };
 }
 
@@ -144,7 +147,7 @@ export function safeErrorMessage(error: unknown) {
     if (code === 'SELF_SIGNED_CERT_IN_CHAIN' || code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
         return 'TLS verification failed. Set DB_SSL_ROOT_CERT to the database CA certificate file.';
     }
-    return `Import failed${/^[A-Z0-9]{5}$/.test(code) ? ` (database code ${code})` : ''}. No commit was confirmed.`;
+    return `Import failed${/^[A-Z0-9]{5}$/.test(code) ? ` (database code ${code})` : ''}. Nothing was committed.`;
 }
 
 export async function importCsv({ signal, log = console.log, ...input }: ImportInput & {
@@ -154,75 +157,74 @@ export async function importCsv({ signal, log = console.log, ...input }: ImportI
     const config = resolveConfig(input);
     const target = `${quoteIdentifier(config.schema)}.${quoteIdentifier(config.table)}`;
     const started = Date.now();
-    log('Validating CSV before connecting to the database.');
+    log('Checking CSV file...');
     const validated = await validateCsv(config.csvPath, { ...config, signal, log });
-    log(`CSV validated: ${validated.rows.toLocaleString('en-US')} rows.`);
+    log(`CSV OK: ${validated.rows.toLocaleString('en-US')} rows.`);
 
     const client = new Client({ connectionString: config.dsn, connectionTimeoutMillis: 10_000 });
     const controller = new AbortController();
-    const onAbort = () => controller.abort();
-    const onConnectionError = () => controller.abort();
-    signal?.addEventListener('abort', onAbort, { once: true });
+    const abort = () => controller.abort();
+    signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) controller.abort();
-    client.on('error', onConnectionError);
-    let transactionStarted = false;
-    let commitAttempted = false;
-    let committed = false;
+    client.on('error', abort);
+    let phase: 'none' | 'open' | 'committing' | 'committed' = 'none';
     try {
         controller.signal.throwIfAborted();
+        log('Connecting to database...');
         await client.connect();
         await client.query('BEGIN');
-        transactionStarted = true;
+        phase = 'open';
         await client.query("SET LOCAL lock_timeout = '5s'");
         await client.query("SET LOCAL statement_timeout = '15s'");
         await verifyTarget(client, config, target);
         await client.query('SET LOCAL statement_timeout = 0');
         controller.signal.throwIfAborted();
-        log(`Target verified: ${config.database}, ${target}. Starting COPY.`);
+        log(`Connected to ${config.database}. Starting COPY into ${target}...`);
         let lastProgress = Date.now();
         const digest = new FileDigest((bytes) => {
-            if (Date.now() - lastProgress >= 5_000) {
-                log(`COPY streamed ${(bytes / 1024 / 1024).toFixed(1)} MiB (not committed).`);
-                lastProgress = Date.now();
+            const now = Date.now();
+            if (now - lastProgress >= 5_000) {
+                log(`${(bytes / 1024 / 1024).toFixed(1)} MiB uploaded (not committed).`);
+                lastProgress = now;
             }
         });
         const copy = client.query(copyFrom(`
             COPY ${target} (${config.columns.map(quoteIdentifier).join(', ')})
-            FROM STDIN WITH (FORMAT CSV, HEADER true, ENCODING 'UTF8', DELIMITER '${config.delimiter.replace(/'/g, "''")}')
+            FROM STDIN WITH (FORMAT CSV, HEADER true, ENCODING 'UTF8', DELIMITER '${config.delimiter}')
         `));
         await pipeline(createReadStream(config.csvPath), digest, copy, { signal: controller.signal });
         if (digest.digest() !== validated.sha256 || digest.bytes !== validated.bytes) {
-            throw new ImportError('CSV changed after validation. Import will be rolled back.');
+            throw new ImportError('CSV file changed after validation. Rolling back.');
         }
         if (copy.rowCount !== validated.rows) {
-            throw new ImportError('COPY row count did not match the validated CSV. Import will be rolled back.');
+            throw new ImportError('Row count from database did not match the CSV. Rolling back.');
         }
         controller.signal.throwIfAborted();
-        commitAttempted = true;
+        phase = 'committing';
         await client.query('COMMIT');
-        committed = true;
+        phase = 'committed';
         log(`Committed ${copy.rowCount.toLocaleString('en-US')} rows in ${((Date.now() - started) / 1000).toFixed(1)} seconds.`);
         return copy.rowCount;
     } catch (error) {
-        if (transactionStarted && !committed) {
+        if (phase === 'open') {
             try {
                 await client.query('ROLLBACK');
-                if (!commitAttempted) log('Import rolled back.');
+                log('Rolled back.');
             } catch {
-                log('Rollback could not be confirmed.');
+                log('Rollback did not confirm. Check database state.');
             }
         }
-        if (commitAttempted) throw new ImportError('Commit was not confirmed. Check database state before retrying.');
-        if (signal?.aborted) throw new ImportError('Import was interrupted before commit.');
+        if (phase === 'committing') throw new ImportError('Commit was not confirmed. Check database state before retrying.');
+        if (signal?.aborted) throw new ImportError('Interrupted before commit. Nothing was committed.');
         throw error;
     } finally {
-        signal?.removeEventListener('abort', onAbort);
+        signal?.removeEventListener('abort', abort);
         try {
             await client.end();
         } catch {
             // A broken connection may already be closed; preserve the import outcome.
         }
-        client.removeListener('error', onConnectionError);
+        client.removeListener('error', abort);
     }
 }
 

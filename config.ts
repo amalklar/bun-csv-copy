@@ -61,8 +61,8 @@ export function resolveConfig(input: ImportInput): ImportConfig {
         throw new ImportError('The UAS profile requires user_id,product_category_combination,credit_line_family in that order.');
     }
     const delimiter = input.delimiter === '\\t' ? '\t' : input.delimiter ?? ',';
-    if (delimiter.length !== 1 || delimiter.charCodeAt(0) > 127 || /[\0\r\n"\\]/.test(delimiter)) {
-        throw new ImportError('CSV_DELIMITER must be one ASCII character other than NUL, newline, quote, or backslash.');
+    if (delimiter.length !== 1 || delimiter.charCodeAt(0) > 127 || /[\0\r\n'"\\]/.test(delimiter)) {
+        throw new ImportError('CSV_DELIMITER must be one ASCII character other than NUL, newline, single quote, double quote, or backslash.');
     }
     let database: string;
     try {
