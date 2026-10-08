@@ -1,0 +1,245 @@
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { Transform, Writable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { parse } from 'fast-csv';
+import { Client } from 'pg';
+import { from as copyFrom } from 'pg-copy-streams';
+import { ImportError, quoteIdentifier, readConfig, resolveConfig, UAS_COLUMNS } from './config';
+import type { ImportConfig, ImportInput } from './config';
+
+const FAMILIES = new Set(['KLAR_FAMILY', 'UBER_FAMILY']);
+type Logger = (message: string) => void;
+export { ImportError } from './config';
+
+class FileDigest extends Transform {
+    private readonly hash = createHash('sha256');
+    bytes = 0;
+
+    constructor(private readonly progress?: (bytes: number) => void) {
+        super();
+    }
+
+    override _transform(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void) {
+        this.hash.update(chunk);
+        this.bytes += chunk.length;
+        this.progress?.(this.bytes);
+        this.push(chunk);
+        callback();
+    }
+
+    digest() {
+        return this.hash.digest('hex');
+    }
+}
+
+export async function validateCsv(csvPath: string, { signal, log = () => {}, columns = UAS_COLUMNS,
+    profile = 'uas', delimiter = ',' }: {
+    signal?: AbortSignal; log?: Logger; columns?: string[];
+    profile?: ImportConfig['profile']; delimiter?: string;
+} = {}) {
+    let rows = 0;
+    let headerSeen = false;
+    const digest = new FileDigest();
+    const parser = parse({
+        headers: (headers) => {
+            if (headers.length !== columns.length || headers.some((header, i) => header !== columns[i])) {
+                throw new ImportError(`CSV header must be exactly ${columns.join(delimiter)}.`);
+            }
+            headerSeen = true;
+            return headers;
+        },
+        strictColumnHandling: true,
+        ignoreEmpty: false,
+        delimiter,
+    });
+    parser.on('data-invalid', () => {
+        parser.destroy(new ImportError(`CSV data row ${rows + 1} must have exactly ${columns.length} fields.`));
+    });
+    const validator = new Writable({
+        objectMode: true,
+        write(row: Record<string, string>, _encoding, callback) {
+            if (profile === 'uas' && columns.some((column) => !row[column]?.trim())) {
+                callback(new ImportError(`CSV data row ${rows + 1} has an empty required field.`));
+            } else if (profile === 'uas' && !FAMILIES.has(row.credit_line_family)) {
+                callback(new ImportError(`CSV data row ${rows + 1} has an unsupported credit_line_family.`));
+            } else {
+                rows++;
+                if (rows % 1_000_000 === 0) log(`Validated ${rows.toLocaleString('en-US')} rows.`);
+                callback();
+            }
+        },
+    });
+    try {
+        await pipeline(createReadStream(csvPath), digest, parser, validator, { signal });
+    } catch (error) {
+        if (error instanceof ImportError) throw error;
+        if (signal?.aborted) throw new ImportError('CSV validation was interrupted.');
+        throw new ImportError(`CSV validation failed near data row ${rows + 1}. Check file access and CSV syntax.`);
+    }
+    if (!headerSeen || rows === 0) throw new ImportError('CSV must contain the expected header and at least one data row.');
+    return { rows, bytes: digest.bytes, sha256: digest.digest() };
+}
+
+async function verifyTarget(client: Client, config: ImportConfig, target: string) {
+    const database = await client.query<{ database: string }>('SELECT current_database() AS database');
+    if (database.rows[0].database !== config.database) {
+        throw new ImportError(`Connection must target ${config.database}.`);
+    }
+    // Hold the same lock COPY needs, preventing table changes during verification and import.
+    await client.query(`LOCK TABLE ${target} IN ROW EXCLUSIVE MODE`);
+    const columns = await client.query<{
+        column_name: string;
+        data_type: string;
+        is_nullable: string;
+        column_default: string | null;
+        is_generated: string;
+        is_identity: string;
+    }>(`
+        SELECT column_name, data_type, is_nullable, column_default, is_generated, is_identity
+        FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = $2
+    `, [config.schema, config.table]);
+    for (const name of config.columns) {
+        const column = columns.rows.find((candidate) => candidate.column_name === name);
+        if (!column || column.is_generated !== 'NEVER') {
+            throw new ImportError(`${target}.${name} must be a writable column.`);
+        }
+        if (config.profile === 'uas' && (column.data_type !== 'text' || column.is_nullable !== 'NO')) {
+            throw new ImportError(`${target}.${name} must be a required TEXT column.`);
+        }
+    }
+    const omitted = columns.rows.filter((column) => !config.columns.includes(column.column_name));
+    if (omitted.some((column) => column.is_nullable === 'NO' && column.column_default === null
+        && column.is_generated === 'NEVER' && column.is_identity !== 'YES')) {
+        throw new ImportError(`${target} has an omitted required column without a default.`);
+    }
+    if (config.profile !== 'uas') return;
+    const processed = columns.rows.find((column) => column.column_name === 'processed');
+    const processedAt = columns.rows.find((column) => column.column_name === 'processed_at');
+    if (!processed || processed.data_type !== 'boolean' || processed.is_nullable !== 'NO'
+        || processed.column_default !== 'false' || processed.is_generated !== 'NEVER'
+        || !processedAt || processedAt.data_type !== 'timestamp with time zone'
+        || processedAt.is_nullable !== 'YES' || processedAt.column_default !== null
+        || processedAt.is_generated !== 'NEVER') {
+        throw new ImportError(`${target} must default processed to false and processed_at to NULL.`);
+    }
+    const primaryKey = await client.query<{ columns: string[] }>(`
+        SELECT array_agg(a.attname::text ORDER BY key.ordinality) AS columns
+        FROM pg_constraint c
+        CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS key(attnum, ordinality)
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = key.attnum
+        WHERE c.conrelid = to_regclass($1) AND c.contype = 'p'
+        GROUP BY c.oid
+    `, [target]);
+    if (primaryKey.rows.length !== 1 || primaryKey.rows[0].columns.length !== 1
+        || primaryKey.rows[0].columns[0] !== 'user_id') {
+        throw new ImportError(`${target} must have a primary key on user_id alone.`);
+    }
+}
+
+export function safeErrorMessage(error: unknown) {
+    if (error instanceof ImportError) return error.message;
+    const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
+    if (code === 'SELF_SIGNED_CERT_IN_CHAIN' || code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
+        return 'TLS verification failed. Set DB_SSL_ROOT_CERT to the database CA certificate file.';
+    }
+    return `Import failed${/^[A-Z0-9]{5}$/.test(code) ? ` (database code ${code})` : ''}. No commit was confirmed.`;
+}
+
+export async function importCsv({ signal, log = console.log, ...input }: ImportInput & {
+    signal?: AbortSignal;
+    log?: Logger;
+}) {
+    const config = resolveConfig(input);
+    const target = `${quoteIdentifier(config.schema)}.${quoteIdentifier(config.table)}`;
+    const started = Date.now();
+    log('Validating CSV before connecting to the database.');
+    const validated = await validateCsv(config.csvPath, { ...config, signal, log });
+    log(`CSV validated: ${validated.rows.toLocaleString('en-US')} rows.`);
+
+    const client = new Client({ connectionString: config.dsn, connectionTimeoutMillis: 10_000 });
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    const onConnectionError = () => controller.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) controller.abort();
+    client.on('error', onConnectionError);
+    let transactionStarted = false;
+    let commitAttempted = false;
+    let committed = false;
+    try {
+        controller.signal.throwIfAborted();
+        await client.connect();
+        await client.query('BEGIN');
+        transactionStarted = true;
+        await client.query("SET LOCAL lock_timeout = '5s'");
+        await client.query("SET LOCAL statement_timeout = '15s'");
+        await verifyTarget(client, config, target);
+        await client.query('SET LOCAL statement_timeout = 0');
+        controller.signal.throwIfAborted();
+        log(`Target verified: ${config.database}, ${target}. Starting COPY.`);
+        let lastProgress = Date.now();
+        const digest = new FileDigest((bytes) => {
+            if (Date.now() - lastProgress >= 5_000) {
+                log(`COPY streamed ${(bytes / 1024 / 1024).toFixed(1)} MiB (not committed).`);
+                lastProgress = Date.now();
+            }
+        });
+        const copy = client.query(copyFrom(`
+            COPY ${target} (${config.columns.map(quoteIdentifier).join(', ')})
+            FROM STDIN WITH (FORMAT CSV, HEADER true, ENCODING 'UTF8', DELIMITER '${config.delimiter.replace(/'/g, "''")}')
+        `));
+        await pipeline(createReadStream(config.csvPath), digest, copy, { signal: controller.signal });
+        if (digest.digest() !== validated.sha256 || digest.bytes !== validated.bytes) {
+            throw new ImportError('CSV changed after validation. Import will be rolled back.');
+        }
+        if (copy.rowCount !== validated.rows) {
+            throw new ImportError('COPY row count did not match the validated CSV. Import will be rolled back.');
+        }
+        controller.signal.throwIfAborted();
+        commitAttempted = true;
+        await client.query('COMMIT');
+        committed = true;
+        log(`Committed ${copy.rowCount.toLocaleString('en-US')} rows in ${((Date.now() - started) / 1000).toFixed(1)} seconds.`);
+        return copy.rowCount;
+    } catch (error) {
+        if (transactionStarted && !committed) {
+            try {
+                await client.query('ROLLBACK');
+                if (!commitAttempted) log('Import rolled back.');
+            } catch {
+                log('Rollback could not be confirmed.');
+            }
+        }
+        if (commitAttempted) throw new ImportError('Commit was not confirmed. Check database state before retrying.');
+        if (signal?.aborted) throw new ImportError('Import was interrupted before commit.');
+        throw error;
+    } finally {
+        signal?.removeEventListener('abort', onAbort);
+        try {
+            await client.end();
+        } catch {
+            // A broken connection may already be closed; preserve the import outcome.
+        }
+        client.removeListener('error', onConnectionError);
+    }
+}
+
+if (import.meta.main) {
+    const controller = new AbortController();
+    const interrupt = () => controller.abort();
+    process.once('SIGINT', interrupt);
+    process.once('SIGTERM', interrupt);
+    try {
+        const args = process.argv.slice(2);
+        if (args.length > 1) throw new ImportError('Usage: bun run copy [csv-file]');
+        await importCsv({ ...readConfig(process.env, args[0]), signal: controller.signal });
+    } catch (error) {
+        console.error(safeErrorMessage(error));
+        process.exitCode = 1;
+    } finally {
+        process.removeListener('SIGINT', interrupt);
+        process.removeListener('SIGTERM', interrupt);
+    }
+}

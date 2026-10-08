@@ -1,0 +1,11 @@
+node_modules/
+.context/
+.env
+.env.*
+!.env.example
+*.csv
+*.pem
+*.key
+*.log
+*.tsbuildinfo
+.DS_Store
