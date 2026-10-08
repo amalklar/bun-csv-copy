@@ -43,12 +43,12 @@ run the command there.
 | `CSV_COLUMNS` | Target columns in CSV header order, separated by commas | UAS columns below; required for generic |
 | `CSV_DELIMITER` | One ASCII separator; `\t` means tab | `,` |
 | `DB_SSL_ROOT_CERT` | CA certificate file | Optional; `sslrootcert` in the URL also works |
+| `DEBUG` | Set to `1` to print where an error happened | Off |
 
 The CSV header must match `CSV_COLUMNS` exactly, including order.
 Names can contain letters, digits, underscores, or dollar signs, must start with
 a letter or underscore, and have a 63-character limit. SQL preserves their case.
-URL-encode special characters in credentials. Logs exclude credentials and user
-records; database errors show a code instead of row details.
+URL-encode special characters in credentials.
 
 ## UAS
 
@@ -95,6 +95,21 @@ constraint failures, and stream interruptions abort the load.
 Progress shows bytes streamed. Success means PostgreSQL confirmed the commit.
 Ctrl-C before commit requests rollback. If commit confirmation is lost, check
 the database before retrying.
+
+## Errors
+
+Each failure names the step that failed, explains the error code in plain
+words, and adds safe details such as the table, constraint, column, and CSV
+line. It never prints credentials or row values. For example:
+
+```text
+Connecting to HOST:5432/uas from DB_URL (sslmode default)...
+Import failed while connecting to the database. Database host not found. Check the VPN and the host in DB_URL or DSN_LIVE. Details: code ENOTFOUND. Nothing was committed.
+```
+
+The connecting line shows which variable supplied the URL, so a leftover
+`DB_URL` that overrides `DSN_LIVE` is easy to spot. Run with `DEBUG=1` to also
+print the stack frames of the error and its causes, without their messages.
 
 ## Tests
 

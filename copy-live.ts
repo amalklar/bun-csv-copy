@@ -5,12 +5,14 @@ import { pipeline } from 'node:stream/promises';
 import { parse } from 'fast-csv';
 import { Client } from 'pg';
 import { from as copyFrom } from 'pg-copy-streams';
-import { ImportError, quoteIdentifier, readConfig, resolveConfig, UAS_COLUMNS } from './config';
+import { quoteIdentifier, readConfig, resolveConfig, UAS_COLUMNS } from './config';
 import type { ImportConfig, ImportInput } from './config';
+import { debugTrace, describeError, errorCode, ImportError, safeErrorMessage } from './errors';
 
 const FAMILIES = new Set(['KLAR_FAMILY', 'UBER_FAMILY']);
+const FILE_ERRORS = new Set(['ENOENT', 'EACCES', 'EISDIR']);
 type Logger = (message: string) => void;
-export { ImportError } from './config';
+export { ImportError, safeErrorMessage } from './errors';
 
 class FileDigest extends Transform {
     private readonly hash = createHash('sha256');
@@ -32,6 +34,8 @@ class FileDigest extends Transform {
         return this.hash.digest('hex');
     }
 }
+
+const mebibytes = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
 
 export async function validateCsv(csvPath: string, { signal, log = () => {}, columns = UAS_COLUMNS,
     profile = 'uas', delimiter = ',' }: {
@@ -78,7 +82,12 @@ export async function validateCsv(csvPath: string, { signal, log = () => {}, col
     } catch (error) {
         if (error instanceof ImportError) throw error;
         if (signal?.aborted) throw new ImportError('CSV validation was interrupted.');
-        throw new ImportError(`CSV validation failed near data row ${rows + 1}. Check file access and CSV syntax.`);
+        const code = errorCode(error);
+        if (FILE_ERRORS.has(code)) {
+            throw new ImportError(`Cannot read the CSV file at ${csvPath}. ${describeError(error)}`, code, { cause: error });
+        }
+        throw new ImportError(`CSV syntax error near data row ${rows + 1}, such as an unclosed quote.`,
+            code || undefined, { cause: error });
     }
     if (rows === 0) throw new ImportError('CSV must contain the expected header and at least one data row.');
     return { rows, bytes: digest.bytes, sha256: digest.digest() };
@@ -86,8 +95,10 @@ export async function validateCsv(csvPath: string, { signal, log = () => {}, col
 
 async function verifyTarget(client: Client, config: ImportConfig, target: string) {
     const database = await client.query<{ database: string }>('SELECT current_database() AS database');
-    if (database.rows[0].database !== config.database) {
-        throw new ImportError(`Connection must target ${config.database}.`);
+    const connected = database.rows[0].database;
+    if (connected !== config.database) {
+        throw new ImportError(`Connection must target ${config.database}, but it reached ${connected}. `
+            + 'Fix DB_NAME or the database in the connection URL.');
     }
     // Hold the same lock COPY needs, preventing table changes during verification and import.
     await client.query(`LOCK TABLE ${target} IN ROW EXCLUSIVE MODE`);
@@ -105,17 +116,21 @@ async function verifyTarget(client: Client, config: ImportConfig, target: string
     `, [config.schema, config.table]);
     for (const name of config.columns) {
         const column = columns.rows.find((candidate) => candidate.column_name === name);
-        if (!column || column.is_generated !== 'NEVER') {
-            throw new ImportError(`${target}.${name} must be a writable column.`);
+        if (!column) throw new ImportError(`${target}.${name} must be a writable column, but it does not exist.`);
+        if (column.is_generated !== 'NEVER') {
+            throw new ImportError(`${target}.${name} must be a writable column, but it is generated.`);
         }
         if (config.profile === 'uas' && (column.data_type !== 'text' || column.is_nullable !== 'NO')) {
-            throw new ImportError(`${target}.${name} must be a required TEXT column.`);
+            throw new ImportError(`${target}.${name} must be a required TEXT column, but it is `
+                + `${column.data_type}${column.is_nullable === 'YES' ? ' and allows NULL' : ''}.`);
         }
     }
-    const omitted = columns.rows.filter((column) => !config.columns.includes(column.column_name));
-    if (omitted.some((column) => column.is_nullable === 'NO' && column.column_default === null
-        && column.is_generated === 'NEVER' && column.is_identity !== 'YES')) {
-        throw new ImportError(`${target} has an omitted required column without a default.`);
+    const missingDefaults = columns.rows.filter((column) => !config.columns.includes(column.column_name)
+        && column.is_nullable === 'NO' && column.column_default === null
+        && column.is_generated === 'NEVER' && column.is_identity !== 'YES');
+    if (missingDefaults.length > 0) {
+        throw new ImportError(`${target} has an omitted required column without a default: `
+            + `${missingDefaults.map((column) => column.column_name).join(', ')}.`);
     }
     if (config.profile !== 'uas') return;
     const processed = columns.rows.find((column) => column.column_name === 'processed');
@@ -135,19 +150,17 @@ async function verifyTarget(client: Client, config: ImportConfig, target: string
         WHERE c.conrelid = to_regclass($1) AND c.contype = 'p'
         GROUP BY c.oid
     `, [target]);
-    if (primaryKey.rows.length !== 1 || primaryKey.rows[0].columns.length !== 1
-        || primaryKey.rows[0].columns[0] !== 'user_id') {
-        throw new ImportError(`${target} must have a primary key on user_id alone.`);
+    const keyColumns = primaryKey.rows[0]?.columns ?? [];
+    if (keyColumns.length !== 1 || keyColumns[0] !== 'user_id') {
+        throw new ImportError(`${target} must have a primary key on user_id alone, but it has `
+            + `${keyColumns.length ? keyColumns.join(', ') : 'none'}.`);
     }
 }
 
-export function safeErrorMessage(error: unknown) {
-    if (error instanceof ImportError) return error.message;
-    const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
-    if (code === 'SELF_SIGNED_CERT_IN_CHAIN' || code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
-        return 'TLS verification failed. Set DB_SSL_ROOT_CERT to the database CA certificate file.';
-    }
-    return `Import failed${/^[A-Z0-9]{5}$/.test(code) ? ` (database code ${code})` : ''}. Nothing was committed.`;
+function connectionLabel(config: ImportConfig) {
+    const url = new URL(config.dsn);
+    const sslMode = url.searchParams.get('sslmode') ?? 'default';
+    return `${url.hostname}:${url.port}${url.pathname} from ${config.dsnSource ?? 'the connection URL'} (sslmode ${sslMode})`;
 }
 
 export async function importCsv({ signal, log = console.log, ...input }: ImportInput & {
@@ -157,34 +170,45 @@ export async function importCsv({ signal, log = console.log, ...input }: ImportI
     const config = resolveConfig(input);
     const target = `${quoteIdentifier(config.schema)}.${quoteIdentifier(config.table)}`;
     const started = Date.now();
-    log('Checking CSV file...');
+    log(`Checking CSV file ${config.csvPath}...`);
     const validated = await validateCsv(config.csvPath, { ...config, signal, log });
-    log(`CSV OK: ${validated.rows.toLocaleString('en-US')} rows.`);
+    log(`CSV OK: ${validated.rows.toLocaleString('en-US')} rows, ${mebibytes(validated.bytes)}.`);
 
-    const client = new Client({ connectionString: config.dsn, connectionTimeoutMillis: 10_000 });
     const controller = new AbortController();
     const abort = () => controller.abort();
     signal?.addEventListener('abort', abort, { once: true });
     if (signal?.aborted) controller.abort();
-    client.on('error', abort);
+    let client: Client | undefined;
+    let connectionError: unknown;
+    const onConnectionError = (error: unknown) => {
+        connectionError ??= error;
+        log(`Database connection error: ${describeError(error)}`);
+        controller.abort();
+    };
     let phase: 'none' | 'open' | 'committing' | 'committed' = 'none';
+    let step = 'connecting to the database';
     try {
         controller.signal.throwIfAborted();
-        log('Connecting to database...');
+        log(`Connecting to ${connectionLabel(config)}...`);
+        client = new Client({ connectionString: config.dsn, connectionTimeoutMillis: 10_000 });
+        client.on('error', onConnectionError);
         await client.connect();
+        step = 'starting the transaction';
         await client.query('BEGIN');
         phase = 'open';
         await client.query("SET LOCAL lock_timeout = '5s'");
         await client.query("SET LOCAL statement_timeout = '15s'");
+        step = `checking ${target}`;
         await verifyTarget(client, config, target);
         await client.query('SET LOCAL statement_timeout = 0');
         controller.signal.throwIfAborted();
         log(`Connected to ${config.database}. Starting COPY into ${target}...`);
+        step = 'copying rows';
         let lastProgress = Date.now();
         const digest = new FileDigest((bytes) => {
             const now = Date.now();
             if (now - lastProgress >= 5_000) {
-                log(`${(bytes / 1024 / 1024).toFixed(1)} MiB uploaded (not committed).`);
+                log(`${mebibytes(bytes)} of ${mebibytes(validated.bytes)} uploaded (not committed).`);
                 lastProgress = now;
             }
         });
@@ -194,37 +218,45 @@ export async function importCsv({ signal, log = console.log, ...input }: ImportI
         `));
         await pipeline(createReadStream(config.csvPath), digest, copy, { signal: controller.signal });
         if (digest.digest() !== validated.sha256 || digest.bytes !== validated.bytes) {
-            throw new ImportError('CSV file changed after validation. Rolling back.');
+            throw new ImportError('CSV changed after validation. Rolling back.');
         }
         if (copy.rowCount !== validated.rows) {
-            throw new ImportError('Row count from database did not match the CSV. Rolling back.');
+            throw new ImportError(`COPY loaded ${copy.rowCount ?? 0} rows, but the CSV has ${validated.rows}. Rolling back.`);
         }
         controller.signal.throwIfAborted();
+        step = 'committing';
         phase = 'committing';
         await client.query('COMMIT');
         phase = 'committed';
         log(`Committed ${copy.rowCount.toLocaleString('en-US')} rows in ${((Date.now() - started) / 1000).toFixed(1)} seconds.`);
         return copy.rowCount;
     } catch (error) {
-        if (phase === 'open') {
+        const failure = connectionError ?? error;
+        if (phase === 'open' && client) {
+            log('Rolling back...');
             try {
                 await client.query('ROLLBACK');
                 log('Rolled back.');
-            } catch {
-                log('Rollback did not confirm. Check database state.');
+            } catch (rollbackError) {
+                log(`Rollback did not confirm. ${describeError(rollbackError)} Check database state.`);
             }
         }
-        if (phase === 'committing') throw new ImportError('Commit was not confirmed. Check database state before retrying.');
-        if (signal?.aborted) throw new ImportError('Interrupted before commit. Nothing was committed.');
-        throw error;
+        if (phase === 'committing') {
+            throw new ImportError(`Commit was not confirmed. ${describeError(failure)} Check database state before retrying.`,
+                errorCode(failure) || undefined, { cause: failure });
+        }
+        if (signal?.aborted) throw new ImportError('Import was interrupted before commit. Nothing was committed.');
+        if (error instanceof ImportError) throw error;
+        throw new ImportError(`Import failed while ${step}. ${describeError(failure)} Nothing was committed.`,
+            errorCode(failure) || undefined, { cause: failure });
     } finally {
         signal?.removeEventListener('abort', abort);
         try {
-            await client.end();
+            await client?.end();
         } catch {
             // A broken connection may already be closed; preserve the import outcome.
         }
-        client.removeListener('error', abort);
+        client?.removeListener('error', onConnectionError);
     }
 }
 
@@ -239,6 +271,8 @@ if (import.meta.main) {
         await importCsv({ ...readConfig(process.env, args[0]), signal: controller.signal });
     } catch (error) {
         console.error(safeErrorMessage(error));
+        if (process.env.DEBUG) console.error(debugTrace(error));
+        else console.error('Set DEBUG=1 to print where the error happened.');
         process.exitCode = 1;
     } finally {
         process.removeListener('SIGINT', interrupt);

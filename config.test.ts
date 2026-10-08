@@ -18,6 +18,11 @@ describe('environment configuration', () => {
         expect(readConfig({ ...BASE, DSN_LIVE: 'invalid' }, '/tmp/override.csv').csvPath).toBe('/tmp/override.csv');
         expect(readConfig({ CSV_PATH: '/tmp/input.csv', DSN_LIVE: DSN }).dsn).toContain('custom_database');
     });
+    test('names the variable that supplied the connection URL', () => {
+        expect(readConfig(BASE).dsnSource).toBe('DB_URL');
+        expect(readConfig({ CSV_PATH: '/tmp/input.csv', DSN_LIVE: DSN }).dsnSource).toBe('DSN_LIVE');
+        expect(() => readConfig({ ...BASE, DB_URL: 'postgresql://HOST/db' })).toThrow('connection URL in DB_URL');
+    });
     test('configures generic targets and tab-delimited input', () => {
         const config = readConfig({ ...BASE, IMPORT_PROFILE: 'generic', DB_SCHEMA: 'OtherSchema',
             DB_TABLE: 'OtherTable', CSV_COLUMNS: 'id, amount', CSV_DELIMITER: '\\t' });
