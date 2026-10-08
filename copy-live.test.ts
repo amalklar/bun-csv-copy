@@ -40,6 +40,13 @@ describe('CSV validation', () => {
         await expect(validateCsv(await fixture(contents))).rejects.toThrow(message);
     });
 
+    test('reports a missing CSV file by path and code', async () => {
+        const missing = join(directory, 'missing.csv');
+        await expect(validateCsv(missing)).rejects.toMatchObject({
+            code: 'ENOENT', message: `Cannot read the CSV file at ${missing}. File not found. Details: code ENOENT.`,
+        });
+    });
+
     test('rejects an aborted validation', async () => {
         const controller = new AbortController();
         controller.abort();

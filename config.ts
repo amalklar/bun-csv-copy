@@ -1,6 +1,6 @@
 import { resolve } from 'node:path';
+import { ImportError } from './errors';
 
-export class ImportError extends Error {}
 export const UAS_COLUMNS = ['user_id', 'product_category_combination', 'credit_line_family'];
 
 export interface ImportConfig {
@@ -13,6 +13,7 @@ export interface ImportConfig {
     columns: string[];
     delimiter: string;
     sslRootCert?: string;
+    dsnSource?: 'DB_URL' | 'DSN_LIVE';
 }
 
 export type ImportInput = Partial<ImportConfig> & { dsn: string };
@@ -30,16 +31,17 @@ export function quoteIdentifier(value: string) {
 
 export function resolveConfig(input: ImportInput): ImportConfig {
     if (!input.dsn.trim()) throw new ImportError('DB_URL or DSN_LIVE must be set.');
+    const source = input.dsnSource ?? 'DB_URL or DSN_LIVE';
     let url: URL;
     try {
         url = new URL(input.dsn);
         if (!['postgres:', 'postgresql:'].includes(url.protocol) || !url.hostname) throw new Error();
     } catch {
-        throw new ImportError('DB_URL or DSN_LIVE must be a PostgreSQL connection URL.');
+        throw new ImportError(`${source} must be a PostgreSQL connection URL.`);
     }
     if (!(url.username || url.searchParams.get('user')) || !(url.password || url.searchParams.get('password'))
         || url.pathname.length <= 1) {
-        throw new ImportError('The connection URL must include the username, password, and database.');
+        throw new ImportError(`The connection URL in ${source} must include the username, password, and database.`);
     }
     if (!url.port && !url.searchParams.get('port')) url.port = '5432';
     if (input.sslRootCert) {
@@ -71,12 +73,17 @@ export function resolveConfig(input: ImportInput): ImportConfig {
         throw new ImportError('The connection URL database name is invalid.');
     }
     if (!database.trim()) throw new ImportError('DB_NAME cannot be empty.');
-    return { dsn: url.toString(), csvPath: input.csvPath, profile, database, schema, table, columns: [...columns], delimiter };
+    return {
+        dsn: url.toString(), csvPath: input.csvPath, profile, database, schema, table, columns: [...columns], delimiter,
+        dsnSource: input.dsnSource,
+    };
 }
 
 export function readConfig(env: Record<string, string | undefined> = process.env, csvArgument?: string) {
+    const dbUrl = env.DB_URL?.trim();
     return resolveConfig({
-        dsn: env.DB_URL?.trim() || env.DSN_LIVE?.trim() || '',
+        dsn: dbUrl || env.DSN_LIVE?.trim() || '',
+        dsnSource: dbUrl ? 'DB_URL' : env.DSN_LIVE?.trim() ? 'DSN_LIVE' : undefined,
         csvPath: csvArgument ?? env.CSV_PATH,
         profile: env.IMPORT_PROFILE as ImportConfig['profile'] | undefined,
         database: env.DB_NAME,
