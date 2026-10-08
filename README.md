@@ -1,73 +1,66 @@
 # bun-csv-copy
 
-Stream a CSV into an existing PostgreSQL table using Bun and `COPY FROM STDIN`.
-The default UAS profile retains account-family backfill validation. The generic
-profile supports other tables and PostgreSQL column types.
+Load a CSV into an existing PostgreSQL table with Bun. Use `uas` for
+account-family backfills or `generic` for other tables. `uas` is the default.
 
-## Setup
+## Run
 
 ```bash
 bun install --frozen-lockfile
 cp .env.example .env
 ```
 
-Edit `.env` with the connection URL and CSV path, then run:
+Set the database URL and CSV path in `.env`, then run:
 
 ```bash
 bun run copy
 ```
 
-This imports and commits rows to the configured database. The importer does not
-create tables, truncate data, overwrite existing rows, or enable a backfill job.
-CSV files, local environment files, and certificate files are ignored by Git.
+The command adds rows and commits them together. It preserves existing rows,
+leaves backfill jobs unchanged, and requires the table to exist.
+Git ignores CSV files, local `.env` files, and certificates.
 
-An optional command argument overrides `CSV_PATH`:
+You can override `CSV_PATH` with a file argument:
 
 ```bash
 bun run copy /absolute/path/input.csv
 ```
 
-`bun run copy:live` remains an alias for the same importer. It does not select
-a live database automatically. Exported shell variables take precedence over
-Bun's `.env` values.
+`bun run copy:live` runs the same importer using your configured database.
+Shell variables override `.env`. If your credentials come from interactive zsh,
+run the command there.
 
-## Configuration
+## Settings
 
-| Variable | Meaning | Default |
+| Variable | Purpose | Default |
 | --- | --- | --- |
-| `DB_URL` | PostgreSQL URL with username, password, host, and database | Required, with `DSN_LIVE` as a compatibility fallback |
-| `CSV_PATH` | Local UTF-8 CSV file | Required unless supplied as an argument |
+| `DB_URL` | PostgreSQL URL with username, password, host, and database | Required; falls back to `DSN_LIVE` |
+| `CSV_PATH` | UTF-8 CSV file | Required unless passed as an argument |
 | `IMPORT_PROFILE` | `uas` or `generic` | `uas` |
-| `DB_NAME` | Expected connected database, checked before COPY | `user_account_database` for UAS; URL database for generic |
+| `DB_NAME` | Expected database, checked before import | UAS: `user_account_database`; generic: URL database |
 | `DB_SCHEMA` | Target schema | `public` |
-| `DB_TABLE` | Target table | `account_family_backfill_tasks` for UAS; required for generic |
-| `CSV_COLUMNS` | Comma-separated target columns in CSV header order | UAS columns below; required for generic |
-| `CSV_DELIMITER` | Single ASCII field separator; `\t` selects tab | `,` |
-| `DB_SSL_ROOT_CERT` | Path to the database CA certificate bundle | Optional; also supports `sslrootcert` in the URL |
+| `DB_TABLE` | Target table | UAS: `account_family_backfill_tasks`; required for generic |
+| `CSV_COLUMNS` | Target columns in CSV header order, separated by commas | UAS columns below; required for generic |
+| `CSV_DELIMITER` | One ASCII separator; `\t` means tab | `,` |
+| `DB_SSL_ROOT_CERT` | CA certificate file | Optional; `sslrootcert` in the URL also works |
 
-Schema, table, and column names must use letters, digits, underscores, or dollar
-signs, start with a letter or underscore, and be at most 63 characters. Names
-are quoted in SQL, so mixed-case names are preserved. `CSV_COLUMNS` always uses
-commas to separate names, even when the file uses another delimiter. The file
-must contain a header matching those names and their order.
+The CSV header must match `CSV_COLUMNS` exactly, including order.
+Names can contain letters, digits, underscores, or dollar signs, must start with
+a letter or underscore, and have a 63-character limit. SQL preserves their case.
+URL-encode special characters in credentials. Logs exclude credentials and user
+records; database errors show a code instead of row details.
 
-URL-encode special characters in credentials. Credentials and user records are
-not printed. Database failures report an error code without the server's row
-details. If your connection variables are initialized by interactive zsh, run
-the command from that shell.
+## UAS
 
-### UAS profile
+The header is `user_id,product_category_combination,credit_line_family`.
+All three fields are required. Families must be `KLAR_FAMILY` or `UBER_FAMILY`.
+The table needs required TEXT columns, a primary key on `user_id`, and defaults
+of `processed = false` and `processed_at = NULL`.
+You can change the database, schema, and table while keeping these checks.
 
-The UAS columns are `user_id,product_category_combination,credit_line_family`.
-Each row must contain three populated fields. Supported families are
-`KLAR_FAMILY` and `UBER_FAMILY`. The table must have required TEXT input columns,
-a primary key on `user_id`, and processing defaults of `processed = false` and
-`processed_at = NULL`. Database, schema, and table names can be configured while
-retaining these checks.
+## Other tables
 
-### Generic profile
-
-For example, given an existing table with columns `id`, `amount`, and `note`:
+Set `IMPORT_PROFILE=generic` and name the table and columns. For example:
 
 ```dotenv
 DB_URL=postgresql://USER:PASSWORD@HOST:5432/example_database?sslmode=verify-full
@@ -80,35 +73,28 @@ CSV_COLUMNS=id,amount,note
 CSV_DELIMITER=,
 ```
 
-Only configured columns are loaded. Omitted columns must be nullable, generated,
-identity columns, or have a default. PostgreSQL validates types and constraints;
-UAS family and processing rules do not apply. Unquoted empty fields become NULL,
-while quoted empty fields remain empty strings. Duplicate rows fail when a
-database uniqueness constraint rejects them; the generic importer does not
-invent uniqueness rules.
+PostgreSQL checks types and constraints. Omitted columns must allow NULL, have a
+default, or generate their own values. Unquoted empty fields become NULL;
+quoted empty fields stay empty strings. Database uniqueness rules decide whether
+duplicate rows fail. UAS checks do not apply.
 
-### TLS certificates
+## TLS
 
-For a database whose CA is not in the system trust store, set
-`DB_SSL_ROOT_CERT=/absolute/path/ca-bundle.pem`. This sets `sslmode=verify-full`
-and verifies both the certificate chain and hostname. For Amazon RDS, download
-the bundle for your database's region from the
+Set `DB_SSL_ROOT_CERT=/absolute/path/ca-bundle.pem` if the database CA is not
+trusted locally. This uses `sslmode=verify-full` to verify the certificate and
+hostname. For RDS, get your region's bundle from the
 [AWS RDS certificate documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html).
-The importer does not disable certificate verification to work around a trust
-error.
 
-## Import behavior
+## Import checks
 
-The importer validates the entire CSV before connecting, then streams the
-original file through one COPY transaction. It checks the connected database,
-target columns, file digest, and COPY row count before committing. It keeps
-stream buffers rather than loading all rows into memory. Empty files, malformed
-CSV, mismatched headers, changed files, database constraint failures, and stream
-interruptions abort the load.
+The importer validates the CSV before connecting and streams it in one
+transaction without holding all rows in memory. It checks the target columns,
+file digest, and row count before committing. Bad input, changed files,
+constraint failures, and stream interruptions abort the load.
 
-Progress reports streamed bytes before commit. The committed row count appears
-only after PostgreSQL acknowledges COMMIT. Ctrl-C before commit requests
-rollback. If commit acknowledgment is lost, check database state before retrying.
+Progress shows bytes streamed. Success means PostgreSQL confirmed the commit.
+Ctrl-C before commit requests rollback. If commit confirmation is lost, check
+the database before retrying.
 
 ## Tests
 
@@ -117,8 +103,7 @@ bun run typecheck
 bun test
 ```
 
-CSV and configuration tests run without a database. To run PostgreSQL integration
-tests, set `COPY_TEST_DSN` to an isolated local database named
-`user_account_database`, including local test credentials. The tests create and
-remove their tables and refuse to use an existing UAS target table. They never
-read `DB_URL` or `DSN_LIVE` for test connections.
+CSV and settings tests need no database. Integration tests use `COPY_TEST_DSN`
+with credentials for an isolated local `user_account_database`. They create and
+remove their tables and refuse an existing UAS target table. Test connections
+never use your `DB_URL` or `DSN_LIVE`.
